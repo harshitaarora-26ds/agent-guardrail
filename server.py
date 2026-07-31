@@ -28,6 +28,20 @@ def iterative_unquote(s):
     return current
 
 
+def strip_path_params(path):
+    """Strip path parameters (;...) from each segment of a path."""
+    # In URI syntax, semicolons can introduce path parameters
+    # e.g., /path;param/.. becomes /path/..
+    segments = path.split("/")
+    cleaned = []
+    for seg in segments:
+        # Remove everything after the first semicolon in each segment
+        if ";" in seg:
+            seg = seg[:seg.index(";")]
+        cleaned.append(seg)
+    return "/".join(cleaned)
+
+
 def normalize_and_check_path(path):
     """
     Normalize a file path and check if it's within the sandbox.
@@ -75,8 +89,6 @@ def normalize_and_check_path(path):
         return False, resolved_full, "Multi-decoded path resolves outside sandbox"
 
     # === Check Unicode NFKC normalized path ===
-    # Catches fullwidth characters: ．．/ (U+FF0E) -> ../ 
-    # Also catches other Unicode tricks
     nfkc_path = unicodedata.normalize("NFKC", path_check)
     nfkc_path = nfkc_path.replace("\\", "/")
     if not os.path.isabs(nfkc_path):
@@ -97,6 +109,27 @@ def normalize_and_check_path(path):
 
     if not (resolved_nfkc_dec == sandbox_normalized or resolved_nfkc_dec.startswith(sandbox_normalized + "/")):
         return False, resolved_nfkc_dec, "Unicode+decoded path resolves outside sandbox"
+
+    # === Check with path parameters stripped (;param style) ===
+    # Servers like Tomcat treat ..;foo/ as ../
+    stripped = strip_path_params(path_check)
+    if not os.path.isabs(stripped):
+        resolved_stripped = os.path.normpath(os.path.join(SANDBOX_ROOT, stripped))
+    else:
+        resolved_stripped = os.path.normpath(stripped)
+
+    if not (resolved_stripped == sandbox_normalized or resolved_stripped.startswith(sandbox_normalized + "/")):
+        return False, resolved_stripped, "Path with params stripped resolves outside sandbox"
+
+    # Also check stripped + decoded
+    stripped_decoded = strip_path_params(fully_decoded)
+    if not os.path.isabs(stripped_decoded):
+        resolved_sd = os.path.normpath(os.path.join(SANDBOX_ROOT, stripped_decoded))
+    else:
+        resolved_sd = os.path.normpath(stripped_decoded)
+
+    if not (resolved_sd == sandbox_normalized or resolved_sd.startswith(sandbox_normalized + "/")):
+        return False, resolved_sd, "Stripped+decoded path resolves outside sandbox"
 
     # Use the raw resolved path for actual file reading
     return True, resolved_raw, "Path is within sandbox"
