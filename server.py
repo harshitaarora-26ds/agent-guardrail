@@ -56,6 +56,11 @@ def normalize_and_check_path(path):
     if "\x00" in path or "%00" in path:
         return False, "", "Null byte in path"
 
+    # Block control characters (except normal printable ASCII and common unicode)
+    for ch in path:
+        if ord(ch) < 0x20 and ch not in ('\t',):
+            return False, "", "Control character in path"
+
     # Replace backslashes with forward slashes
     path_check = path.replace("\\", "/")
 
@@ -130,6 +135,26 @@ def normalize_and_check_path(path):
 
     if not (resolved_sd == sandbox_normalized or resolved_sd.startswith(sandbox_normalized + "/")):
         return False, resolved_sd, "Stripped+decoded path resolves outside sandbox"
+
+    # Also check stripped + NFKC
+    stripped_nfkc = strip_path_params(unicodedata.normalize("NFKC", path_check).replace("\\", "/"))
+    if not os.path.isabs(stripped_nfkc):
+        resolved_sn = os.path.normpath(os.path.join(SANDBOX_ROOT, stripped_nfkc))
+    else:
+        resolved_sn = os.path.normpath(stripped_nfkc)
+
+    if not (resolved_sn == sandbox_normalized or resolved_sn.startswith(sandbox_normalized + "/")):
+        return False, resolved_sn, "Stripped+NFKC path resolves outside sandbox"
+
+    # Also check all combined: stripped + NFKC + decoded
+    stripped_all = strip_path_params(unicodedata.normalize("NFKC", fully_decoded).replace("\\", "/"))
+    if not os.path.isabs(stripped_all):
+        resolved_sa = os.path.normpath(os.path.join(SANDBOX_ROOT, stripped_all))
+    else:
+        resolved_sa = os.path.normpath(stripped_all)
+
+    if not (resolved_sa == sandbox_normalized or resolved_sa.startswith(sandbox_normalized + "/")):
+        return False, resolved_sa, "Fully normalized path resolves outside sandbox"
 
     # Use the raw resolved path for actual file reading
     return True, resolved_raw, "Path is within sandbox"
@@ -287,7 +312,16 @@ def execute_fetch_url(url):
             url = redirect_url
             redirect_count += 1
 
-        # Final check: make sure we didn't end up somewhere bad
+        # Post-fetch: verify the actual IP connected to (TOCTOU defense)
+        try:
+            sock = resp.raw._connection.sock
+            if sock:
+                peer = sock.getpeername()
+                if peer and is_private_ip(peer[0]):
+                    return None, f"Response came from private IP {peer[0]}"
+        except Exception:
+            pass  # Can't check, continue
+
         return resp.text[:10000], None
     except Exception as e:
         return None, f"Error fetching URL: {str(e)}"
