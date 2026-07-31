@@ -4,7 +4,8 @@ import re
 import socket
 import struct
 import ipaddress
-from urllib.parse import urlparse, unquote
+import unicodedata
+from urllib.parse import urlparse, unquote, urljoin
 import requests as http_requests
 
 app = Flask(__name__)
@@ -41,10 +42,10 @@ def normalize_and_check_path(path):
     if "\x00" in path or "%00" in path:
         return False, "", "Null byte in path"
 
-    # Check for backslash-based traversal
+    # Replace backslashes with forward slashes
     path_check = path.replace("\\", "/")
 
-    # Check 1: raw path normalization
+    # === Check raw path ===
     if not os.path.isabs(path_check):
         resolved_raw = os.path.normpath(os.path.join(SANDBOX_ROOT, path_check))
     else:
@@ -53,9 +54,8 @@ def normalize_and_check_path(path):
     if not (resolved_raw == sandbox_normalized or resolved_raw.startswith(sandbox_normalized + "/")):
         return False, resolved_raw, "Path resolves outside sandbox"
 
-    # Check 2: Single URL-decoded path
-    decoded_once = unquote(path_check)
-    decoded_once = decoded_once.replace("\\", "/")
+    # === Check URL-decoded path (single decode) ===
+    decoded_once = unquote(path_check).replace("\\", "/")
     if not os.path.isabs(decoded_once):
         resolved_dec1 = os.path.normpath(os.path.join(SANDBOX_ROOT, decoded_once))
     else:
@@ -64,9 +64,8 @@ def normalize_and_check_path(path):
     if not (resolved_dec1 == sandbox_normalized or resolved_dec1.startswith(sandbox_normalized + "/")):
         return False, resolved_dec1, "Decoded path resolves outside sandbox"
 
-    # Check 3: Fully iteratively decoded path (catches double/triple encoding)
-    fully_decoded = iterative_unquote(path_check)
-    fully_decoded = fully_decoded.replace("\\", "/")
+    # === Check iteratively decoded path (double/triple encoding) ===
+    fully_decoded = iterative_unquote(path_check).replace("\\", "/")
     if not os.path.isabs(fully_decoded):
         resolved_full = os.path.normpath(os.path.join(SANDBOX_ROOT, fully_decoded))
     else:
@@ -75,19 +74,29 @@ def normalize_and_check_path(path):
     if not (resolved_full == sandbox_normalized or resolved_full.startswith(sandbox_normalized + "/")):
         return False, resolved_full, "Multi-decoded path resolves outside sandbox"
 
-    # Check 4: Look for suspicious patterns that might indicate traversal intent
-    # even if normpath doesn't resolve them out
-    # e.g., ....// or ..;/ or other exotic path separators
-    suspicious_patterns = [
-        r'\.\./',       # standard traversal
-        r'\.\.\%',      # encoded traversal component
-        r'\.\.\\',      # backslash traversal
-    ]
-    for pattern in suspicious_patterns:
-        # Check in fully decoded form
-        if re.search(pattern, fully_decoded):
-            # Re-verify after this detection - already covered by normpath check above
-            pass
+    # === Check Unicode NFKC normalized path ===
+    # Catches fullwidth characters: ．．/ (U+FF0E) -> ../ 
+    # Also catches other Unicode tricks
+    nfkc_path = unicodedata.normalize("NFKC", path_check)
+    nfkc_path = nfkc_path.replace("\\", "/")
+    if not os.path.isabs(nfkc_path):
+        resolved_nfkc = os.path.normpath(os.path.join(SANDBOX_ROOT, nfkc_path))
+    else:
+        resolved_nfkc = os.path.normpath(nfkc_path)
+
+    if not (resolved_nfkc == sandbox_normalized or resolved_nfkc.startswith(sandbox_normalized + "/")):
+        return False, resolved_nfkc, "Unicode-normalized path resolves outside sandbox"
+
+    # === Check NFKC + URL decoded combined ===
+    nfkc_decoded = unicodedata.normalize("NFKC", fully_decoded)
+    nfkc_decoded = nfkc_decoded.replace("\\", "/")
+    if not os.path.isabs(nfkc_decoded):
+        resolved_nfkc_dec = os.path.normpath(os.path.join(SANDBOX_ROOT, nfkc_decoded))
+    else:
+        resolved_nfkc_dec = os.path.normpath(nfkc_decoded)
+
+    if not (resolved_nfkc_dec == sandbox_normalized or resolved_nfkc_dec.startswith(sandbox_normalized + "/")):
+        return False, resolved_nfkc_dec, "Unicode+decoded path resolves outside sandbox"
 
     # Use the raw resolved path for actual file reading
     return True, resolved_raw, "Path is within sandbox"
@@ -132,13 +141,17 @@ def check_url_policy(url):
         return False, "Could not parse URL"
 
     # Must be http or https
-    if parsed.scheme.lower() not in ("http", "https"):
-        return False, f"Scheme {parsed.scheme} not allowed"
+    scheme = parsed.scheme.lower()
+    if scheme not in ("http", "https"):
+        return False, f"Scheme {scheme} not allowed"
 
     # Check for userinfo confusion (user:pass@host)
-    # This catches things like http://example.com@evil.com/
     if "@" in (parsed.netloc or ""):
         return False, "URLs with @ in netloc are not allowed"
+
+    # Check for backslash in URL (some parsers treat \ as /)
+    if "\\" in url:
+        return False, "Backslash in URL not allowed"
 
     # Extract hostname
     hostname = parsed.hostname
@@ -147,6 +160,10 @@ def check_url_policy(url):
 
     hostname = hostname.lower().strip().rstrip(".")
 
+    # Block empty hostname
+    if not hostname:
+        return False, "Empty hostname"
+
     # Block IP addresses directly (must use hostname)
     try:
         ipaddress.ip_address(hostname)
@@ -154,13 +171,17 @@ def check_url_policy(url):
     except ValueError:
         pass  # Not an IP, good
 
+    # Block IPv6 bracket notation
+    if hostname.startswith("["):
+        return False, "IPv6 addresses are not allowed"
+
     # Check if hostname is exactly one of the allowed hosts
     if hostname not in ALLOWED_HOSTS:
         return False, f"Host {hostname} is not allowed. Only example.com and www.iana.org are permitted"
 
-    # Resolve DNS and check if it points to a private IP
+    # Resolve DNS and check ALL resolved IPs
     try:
-        ip_addresses = socket.getaddrinfo(hostname, None)
+        ip_addresses = socket.getaddrinfo(hostname, parsed.port or 443, proto=socket.IPPROTO_TCP)
         for addr_info in ip_addresses:
             ip = addr_info[4][0]
             if is_private_ip(ip):
@@ -208,7 +229,6 @@ def execute_fetch_url(url):
 
             # Resolve relative redirects
             if not redirect_url.startswith("http"):
-                from urllib.parse import urljoin
                 redirect_url = urljoin(url, redirect_url)
 
             # Check redirect target against policy
